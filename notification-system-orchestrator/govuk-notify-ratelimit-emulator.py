@@ -4,12 +4,14 @@
 # dependencies = [
 #   "fastapi",
 #   "uvicorn",
-#   "httpx"
+#   "httpx",
+#   "pyjwt"
 # ]
 # ///
 
 import argparse
 import httpx
+import jwt
 import os
 import time
 import uuid
@@ -46,29 +48,29 @@ class RateLimiter:
         self._daily_counters = defaultdict(int)
         self._current_day = datetime.now(timezone.utc).date()
 
-    def check_rate_limit(self, api_key: str) -> bool:
+    def check_rate_limit(self, issuer_id: str) -> bool:
         now = time.time()
         minute_ago = now - 60
 
-        while self._minute_windows[api_key] and self._minute_windows[api_key][0] < minute_ago:
-            self._minute_windows[api_key].popleft()
+        while self._minute_windows[issuer_id] and self._minute_windows[issuer_id][0] < minute_ago:
+            self._minute_windows[issuer_id].popleft()
 
-        if len(self._minute_windows[api_key]) >= MINUTE_LIMIT:
+        if len(self._minute_windows[issuer_id]) >= MINUTE_LIMIT:
             return False
 
-        self._minute_windows[api_key].append(now)
+        self._minute_windows[issuer_id].append(now)
         return True
 
-    def check_daily_limit(self, api_key: str) -> bool:
+    def check_daily_limit(self, issuer_id: str) -> bool:
         today = datetime.now(timezone.utc).date()
         if today != self._current_day:
             self._current_day = today
             self._daily_counters.clear()
 
-        if self._daily_counters[api_key] >= DAILY_LIMIT:
+        if self._daily_counters[issuer_id] >= DAILY_LIMIT:
             return False
 
-        self._daily_counters[api_key] += 1
+        self._daily_counters[issuer_id] += 1
         return True
 
 
@@ -78,9 +80,15 @@ rate_limiter = RateLimiter()
 def extract_api_key(auth_header: str) -> str:
     if auth_header.startswith("Bearer "):
         return auth_header.split("Bearer ")[1]
+    return None
 
 
-@app.post(EMAIL_ENDPOINT)
+def get_issuer_from_jwt(token: str) -> str:
+    payload = jwt.decode(token, options={"verify_signature": False})
+    return payload.get("iss")
+
+
+@app.post(EMAIL_ENDPOINT, status_code=201)
 async def send_email(request: Request):
     body = await request.json()
 
@@ -88,13 +96,16 @@ async def send_email(request: Request):
     api_key = extract_api_key(auth_header)
 
     if api_key and "test-ratelimit" in body.get("email_address", ""):
-        if not rate_limiter.check_daily_limit(api_key):
+        issuer_id = get_issuer_from_jwt(api_key)
+        print(f"Mocking ... API Key: {api_key[:10]}... Issuer: {issuer_id}")
+
+        if not rate_limiter.check_daily_limit(issuer_id):
             raise HTTPException(
                 status_code=429,
                 detail=f"Daily limit exceeded: {DAILY_LIMIT} emails per day allowed"
             )
 
-        if not rate_limiter.check_rate_limit(api_key):
+        if not rate_limiter.check_rate_limit(issuer_id):
             raise HTTPException(
                 status_code=429,
                 detail=f"Rate limit exceeded: {MINUTE_LIMIT} requests per minute allowed"
